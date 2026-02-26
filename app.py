@@ -1,10 +1,9 @@
 import os
 import math
-from typing import Dict, Any, Literal
+from typing import Dict, Any
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,7 +41,7 @@ debug.STATS_HEADERS = {
 
 DEFAULT_SEASON = os.getenv("DEFAULT_SEASON", "2025-26")
 
-app = FastAPI(title="NBA Stats Wrapper", version="1.2.0")
+app = FastAPI(title="NBA Stats Wrapper", version="1.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,6 +49,56 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# ----------------------------
+# Normal CDF + PPF (NO SCIPY)
+# ----------------------------
+def normal_cdf(z: float) -> float:
+    # Standard normal CDF using erf
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+def normal_ppf(p: float) -> float:
+    """
+    Approx inverse CDF for standard normal (Acklam approximation).
+    Good enough for p10/p90 reporting.
+    """
+    if p <= 0.0:
+        return -math.inf
+    if p >= 1.0:
+        return math.inf
+
+    # Coefficients in rational approximations
+    a = [-3.969683028665376e+01,  2.209460984245205e+02,
+         -2.759285104469687e+02,  1.383577518672690e+02,
+         -3.066479806614716e+01,  2.506628277459239e+00]
+    b = [-5.447609879822406e+01,  1.615858368580409e+02,
+         -1.556989798598866e+02,  6.680131188771972e+01,
+         -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01,
+         -2.400758277161838e+00, -2.549732539343734e+00,
+          4.374664141464968e+00,  2.938163982698783e+00]
+    d = [ 7.784695709041462e-03,  3.224671290700398e-01,
+          2.445134137142996e+00,  3.754408661907416e+00]
+
+    plow = 0.02425
+    phigh = 1 - plow
+
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
+               ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
+                 ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+
+    q = p - 0.5
+    r = q * q
+    return (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5]) * q / \
+           (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1)
+
+def normal_ppf_loc_scale(p: float, mean: float, sd: float) -> float:
+    return mean + sd * normal_ppf(p)
 
 # ----------------------------
 # Helpers: odds / no-vig
@@ -61,13 +110,11 @@ def american_to_implied_prob(odds: int) -> float:
         return (-odds) / ((-odds) + 100.0)
     return 100.0 / (odds + 100.0)
 
-
 def no_vig_two_way(p_over: float, p_under: float) -> Dict[str, float]:
     s = p_over + p_under
     if s <= 0:
         return {"p_over": 0.5, "p_under": 0.5, "vig": 0.0}
     return {"p_over": p_over / s, "p_under": p_under / s, "vig": max(0.0, s - 1.0)}
-
 
 # ----------------------------
 # Helpers: nba_api -> DataFrame
@@ -78,18 +125,16 @@ def safe_float(x, default=0.0) -> float:
     except Exception:
         return float(default)
 
-
 def gamelog_df(player_id: int, season: str) -> pd.DataFrame:
     """
-    Pulls player game log via nba_api.
-    If stats.nba.com blocks/timeouts, we convert it to a readable 502 error.
+    Hardened nba_api call: longer timeout + readable errors.
     """
     try:
         gl = playergamelog.PlayerGameLog(
             player_id=player_id,
             season=season,
-            timeout=60,                    # increase timeout for Render
-            raise_exception_on_error=True, # bubble up HTTP problems
+            timeout=60,
+            raise_exception_on_error=True,
         )
         d = gl.get_dict()
         rs = d.get("resultSets", [])
@@ -99,57 +144,41 @@ def gamelog_df(player_id: int, season: str) -> pd.DataFrame:
         rows = rs[0]["rowSet"]
         return pd.DataFrame(rows, columns=headers)
     except Exception as e:
-        # IMPORTANT: this makes your errors readable (instead of Render "500")
         msg = f"{type(e).__name__}: {str(e)}"
         raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
 
 # ----------------------------
 # Pro-style baseline model (Minutes × Rate)
 # ----------------------------
-STAT_MAP = {
-    "PTS": "PTS",
-    "REB": "REB",
-    "AST": "AST",
-    "FG3M": "FG3M",  # 3PM
-}
-PropStat = Literal["PTS", "REB", "AST", "FG3M"]
-
+STAT_MAP = {"PTS": "PTS", "REB": "REB", "AST": "AST", "FG3M": "FG3M"}
 
 def estimate_minutes(df: pd.DataFrame, last_n: int = 10) -> Dict[str, float]:
     if df.empty:
         return {"mean": 0.0, "sd": 8.0}
-
     mins = df["MIN"].tail(last_n).apply(safe_float).to_numpy()
     if len(mins) == 0:
         return {"mean": 0.0, "sd": 8.0}
-
     mean = float(np.mean(mins))
     sd = float(np.std(mins, ddof=1)) if len(mins) > 1 else 6.0
     sd = float(np.clip(sd, 3.0, 12.0))
     return {"mean": mean, "sd": sd}
 
-
 def estimate_rate_per_minute(df: pd.DataFrame, stat_col: str, last_n: int = 15) -> Dict[str, float]:
     if df.empty:
         return {"mean": 0.0, "sd": 0.05}
-
     tail = df.tail(last_n).copy()
     tail["MIN_f"] = tail["MIN"].apply(safe_float)
     tail[stat_col] = tail[stat_col].apply(safe_float)
-
     tail = tail[tail["MIN_f"] > 0]
     if tail.empty:
         return {"mean": 0.0, "sd": 0.05}
-
     rates = (tail[stat_col] / tail["MIN_f"]).to_numpy()
     mean = float(np.mean(rates))
     sd = float(np.std(rates, ddof=1)) if len(rates) > 1 else max(0.03, 0.15 * mean)
     sd = float(np.clip(sd, 0.02, 0.25))
     return {"mean": mean, "sd": sd}
 
-
 def combine_minutes_rate_to_stat_dist(mins: Dict[str, float], rate: Dict[str, float]) -> Dict[str, float]:
-    # X = M * R, approximate variance assuming independence
     m_mu, m_sd = mins["mean"], mins["sd"]
     r_mu, r_sd = rate["mean"], rate["sd"]
 
@@ -159,13 +188,11 @@ def combine_minutes_rate_to_stat_dist(mins: Dict[str, float], rate: Dict[str, fl
     sd = float(np.clip(sd, 1.0, 15.0))
     return {"mean": float(mean), "sd": float(sd)}
 
-
 def prob_over(line: float, mean: float, sd: float) -> float:
     if sd <= 0:
         return 1.0 if mean > line else 0.0
     z = (mean - line) / sd
-    return float(norm.cdf(z))
-
+    return float(normal_cdf(z))
 
 def confidence_label(minutes_sd: float, stat_sd: float, n_games: int) -> str:
     risk = 0
@@ -179,13 +206,11 @@ def confidence_label(minutes_sd: float, stat_sd: float, n_games: int) -> str:
         risk += 2
     elif stat_sd >= 7:
         risk += 1
-
     if risk <= 1:
         return "high"
     if risk <= 3:
         return "medium"
     return "low"
-
 
 def unit_sizing(edge_pct: float, confidence: str) -> Dict[str, Any]:
     if edge_pct < 2.0 or confidence == "low":
@@ -203,7 +228,6 @@ def unit_sizing(edge_pct: float, confidence: str) -> Dict[str, Any]:
 def health():
     return {"ok": True, "default_season": DEFAULT_SEASON}
 
-
 @app.get("/players/search")
 def search_players(q: str):
     q = (q or "").strip()
@@ -211,7 +235,6 @@ def search_players(q: str):
         raise HTTPException(status_code=400, detail="q must be at least 2 characters")
     results = players.find_players_by_full_name(q)
     return {"query": q, "results": results[:10]}
-
 
 @app.get("/meta/player/by_name")
 def player_by_name(name: str):
@@ -223,11 +246,9 @@ def player_by_name(name: str):
         raise HTTPException(status_code=404, detail=f"No players found for '{name}'")
     return {"best_match": results[0], "top_matches": results[:10]}
 
-
 @app.get("/teams")
 def list_teams():
     return {"results": teams.get_teams()}
-
 
 @app.get("/meta/team/by_abbr")
 def team_by_abbr(abbr: str):
@@ -236,7 +257,6 @@ def team_by_abbr(abbr: str):
         if t.get("abbreviation") == abbr:
             return t
     raise HTTPException(status_code=404, detail=f"Team not found for abbreviation '{abbr}'")
-
 
 @app.get("/scoreboard")
 def get_scoreboard(game_date: str):
@@ -254,15 +274,10 @@ def get_scoreboard(game_date: str):
         msg = f"{type(e).__name__}: {str(e)}"
         raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
 
-
 @app.get("/player/{player_id}/gamelog")
 def get_player_gamelog(player_id: int, season: str = DEFAULT_SEASON):
-    # uses the same hardened fetch
     df = gamelog_df(int(player_id), str(season))
-    # Return in the same “nba_api style” dict shape? Here we return dataframe records
-    # so GPT can read it easily. If you prefer nba_api raw dict, tell me.
     return {"player_id": int(player_id), "season": str(season), "rows": df.to_dict(orient="records")}
-
 
 @app.get("/team/{team_id}/gamelog")
 def get_team_gamelog(team_id: int, season: str = DEFAULT_SEASON, season_type: str = "Regular Season"):
@@ -279,7 +294,6 @@ def get_team_gamelog(team_id: int, season: str = DEFAULT_SEASON, season_type: st
         msg = f"{type(e).__name__}: {str(e)}"
         raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
 
-
 @app.get("/teamstats")
 def get_team_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", season_type: str = "Regular Season"):
     try:
@@ -294,7 +308,6 @@ def get_team_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", seas
     except Exception as e:
         msg = f"{type(e).__name__}: {str(e)}"
         raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
-
 
 @app.get("/playerstats")
 def get_player_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", season_type: str = "Regular Season"):
@@ -311,7 +324,6 @@ def get_player_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", se
         msg = f"{type(e).__name__}: {str(e)}"
         raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
 
-
 @app.get("/team/{team_id}/splits")
 def get_team_splits(team_id: int, season: str = DEFAULT_SEASON, season_type: str = "Regular Season"):
     try:
@@ -327,23 +339,11 @@ def get_team_splits(team_id: int, season: str = DEFAULT_SEASON, season_type: str
         msg = f"{type(e).__name__}: {str(e)}"
         raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
 
-
 # ----------------------------
 # Pro-style prop prediction endpoint
 # ----------------------------
 @app.post("/predict/prop")
 def predict_prop(payload: Dict[str, Any]):
-    """
-    payload example:
-    {
-      "player_id": 2544,
-      "season": "2025-26",
-      "stat": "PTS",
-      "line": 27.5,
-      "over_odds": -110,
-      "under_odds": -110
-    }
-    """
     player_id = payload.get("player_id")
     season = payload.get("season", DEFAULT_SEASON)
     stat: str = payload.get("stat", "PTS")
@@ -377,9 +377,9 @@ def predict_prop(payload: Dict[str, Any]):
     p_under_model = 1.0 - p_over_model
 
     # Percentiles (normal approx)
-    p10 = float(norm.ppf(0.10, loc=mean, scale=sd))
-    p50 = float(mean)
-    p90 = float(norm.ppf(0.90, loc=mean, scale=sd))
+    p10 = normal_ppf_loc_scale(0.10, mean, sd)
+    p50 = mean
+    p90 = normal_ppf_loc_scale(0.90, mean, sd)
 
     confidence = confidence_label(mins["sd"], sd, n_games)
 
@@ -401,13 +401,11 @@ def predict_prop(payload: Dict[str, Any]):
         }
         stake = unit_sizing(edge_pct, confidence)
 
-    # Recommendation logic
     pick = "NO_BET"
     if edge_pct is not None:
         if stake["recommendation"] == "PLAY":
             pick = "OVER" if p_over_model >= 0.5 else "UNDER"
     else:
-        # if no odds, only lean when clearly away from 50% and not low confidence
         if confidence != "low" and abs(p_over_model - 0.5) >= 0.06:
             pick = "OVER" if p_over_model > 0.5 else "UNDER"
 
@@ -439,6 +437,6 @@ def predict_prop(payload: Dict[str, Any]):
             "minutes_mean": round(mins["mean"], 2),
             "minutes_sd": round(mins["sd"], 2),
             "rate_per_min_mean": round(rate["mean"], 4),
-            "rate_per_min_sd": round(rate["sd"], 4),
+            "rate_per_min_sd": round(rate["mean"], 4),
         },
     }
