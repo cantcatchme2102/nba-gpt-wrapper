@@ -1,5 +1,10 @@
 import os
-from typing import Optional
+import math
+from typing import Dict, Any, Literal
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,18 +19,169 @@ from nba_api.stats.endpoints import (
     teamdashboardbygeneralsplits,
 )
 
-app = FastAPI(title="NBA Stats Wrapper", version="1.0.0")
+app = FastAPI(title="NBA Stats Wrapper", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 DEFAULT_SEASON = os.getenv("DEFAULT_SEASON", "2025-26")
 
+# ----------------------------
+# Helpers: odds / no-vig
+# ----------------------------
+def american_to_implied_prob(odds: int) -> float:
+    if odds == 0:
+        raise ValueError("odds cannot be 0")
+    if odds < 0:
+        return (-odds) / ((-odds) + 100.0)
+    return 100.0 / (odds + 100.0)
 
+
+def no_vig_two_way(p_over: float, p_under: float) -> Dict[str, float]:
+    s = p_over + p_under
+    if s <= 0:
+        return {"p_over": 0.5, "p_under": 0.5, "vig": 0.0}
+    return {"p_over": p_over / s, "p_under": p_under / s, "vig": max(0.0, s - 1.0)}
+
+
+def odds_to_decimal(odds: int) -> float:
+    if odds < 0:
+        return 1.0 + (100.0 / (-odds))
+    return 1.0 + (odds / 100.0)
+
+
+def kelly_fraction(p: float, b: float) -> float:
+    # b = decimal_odds - 1
+    if b <= 0:
+        return 0.0
+    f = (b * p - (1.0 - p)) / b
+    return max(0.0, f)
+
+
+# ----------------------------
+# Helpers: nba_api -> DataFrame
+# ----------------------------
+def safe_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def gamelog_df(player_id: int, season: str) -> pd.DataFrame:
+    gl = playergamelog.PlayerGameLog(player_id=player_id, season=season)
+    d = gl.get_dict()
+    rs = d.get("resultSets", [])
+    if not rs:
+        return pd.DataFrame()
+    headers = rs[0]["headers"]
+    rows = rs[0]["rowSet"]
+    return pd.DataFrame(rows, columns=headers)
+
+
+# ----------------------------
+# Pro-style baseline model
+# (Minutes × Rate with uncertainty)
+# ----------------------------
+STAT_MAP = {
+    "PTS": "PTS",
+    "REB": "REB",
+    "AST": "AST",
+    "FG3M": "FG3M",  # 3PM
+}
+PropStat = Literal["PTS", "REB", "AST", "FG3M"]
+
+
+def estimate_minutes(df: pd.DataFrame, last_n: int = 10) -> Dict[str, float]:
+    if df.empty:
+        return {"mean": 0.0, "sd": 8.0}
+
+    mins = df["MIN"].tail(last_n).apply(safe_float).to_numpy()
+    if len(mins) == 0:
+        return {"mean": 0.0, "sd": 8.0}
+
+    mean = float(np.mean(mins))
+    sd = float(np.std(mins, ddof=1)) if len(mins) > 1 else 6.0
+    sd = float(np.clip(sd, 3.0, 12.0))
+    return {"mean": mean, "sd": sd}
+
+
+def estimate_rate_per_minute(df: pd.DataFrame, stat_col: str, last_n: int = 15) -> Dict[str, float]:
+    if df.empty:
+        return {"mean": 0.0, "sd": 0.05}
+
+    tail = df.tail(last_n).copy()
+    tail["MIN_f"] = tail["MIN"].apply(safe_float)
+    tail[stat_col] = tail[stat_col].apply(safe_float)
+
+    tail = tail[tail["MIN_f"] > 0]
+    if tail.empty:
+        return {"mean": 0.0, "sd": 0.05}
+
+    rates = (tail[stat_col] / tail["MIN_f"]).to_numpy()
+    mean = float(np.mean(rates))
+    sd = float(np.std(rates, ddof=1)) if len(rates) > 1 else max(0.03, 0.15 * mean)
+    sd = float(np.clip(sd, 0.02, 0.25))
+    return {"mean": mean, "sd": sd}
+
+
+def combine_minutes_rate_to_stat_dist(mins: Dict[str, float], rate: Dict[str, float]) -> Dict[str, float]:
+    # X = M * R, approx variance assuming independence
+    m_mu, m_sd = mins["mean"], mins["sd"]
+    r_mu, r_sd = rate["mean"], rate["sd"]
+
+    mean = m_mu * r_mu
+    var = (m_mu**2) * (r_sd**2) + (r_mu**2) * (m_sd**2) + (m_sd**2) * (r_sd**2)
+    sd = math.sqrt(max(1e-9, var))
+    sd = float(np.clip(sd, 1.0, 15.0))
+    return {"mean": float(mean), "sd": float(sd)}
+
+
+def prob_over(line: float, mean: float, sd: float) -> float:
+    if sd <= 0:
+        return 1.0 if mean > line else 0.0
+    z = (mean - line) / sd
+    return float(norm.cdf(z))
+
+
+def confidence_label(minutes_sd: float, stat_sd: float, n_games: int) -> str:
+    risk = 0
+    if n_games < 8:
+        risk += 2
+    if minutes_sd >= 9:
+        risk += 2
+    elif minutes_sd >= 7:
+        risk += 1
+    if stat_sd >= 10:
+        risk += 2
+    elif stat_sd >= 7:
+        risk += 1
+
+    if risk <= 1:
+        return "high"
+    if risk <= 3:
+        return "medium"
+    return "low"
+
+
+def unit_sizing(edge_pct: float, confidence: str) -> Dict[str, Any]:
+    # Conservative “pro-ish” unit buckets
+    if edge_pct < 2.0 or confidence == "low":
+        return {"recommendation": "NO_BET", "units": 0.0}
+    if edge_pct < 3.5:
+        return {"recommendation": "PLAY", "units": 0.5}
+    if edge_pct < 6.0:
+        return {"recommendation": "PLAY", "units": 1.0}
+    return {"recommendation": "PLAY", "units": 1.5}
+
+
+# ----------------------------
+# Read data endpoints
+# ----------------------------
 @app.get("/health")
 def health():
     return {"ok": True, "default_season": DEFAULT_SEASON}
@@ -47,6 +203,9 @@ def list_teams():
 
 @app.get("/scoreboard")
 def get_scoreboard(game_date: str):
+    """
+    game_date: YYYY-MM-DD (example: 2026-02-25)
+    """
     game_date = (game_date or "").strip()
     if len(game_date) != 10:
         raise HTTPException(status_code=400, detail="game_date must be YYYY-MM-DD")
@@ -67,11 +226,7 @@ def get_team_gamelog(team_id: int, season: str = DEFAULT_SEASON, season_type: st
 
 
 @app.get("/teamstats")
-def get_team_stats(
-    season: str = DEFAULT_SEASON,
-    per_mode: str = "PerGame",
-    season_type: str = "Regular Season",
-):
+def get_team_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", season_type: str = "Regular Season"):
     ts = leaguedashteamstats.LeagueDashTeamStats(
         season=season,
         per_mode_detailed=per_mode,
@@ -81,11 +236,7 @@ def get_team_stats(
 
 
 @app.get("/playerstats")
-def get_player_stats(
-    season: str = DEFAULT_SEASON,
-    per_mode: str = "PerGame",
-    season_type: str = "Regular Season",
-):
+def get_player_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", season_type: str = "Regular Season"):
     ps = leaguedashplayerstats.LeagueDashPlayerStats(
         season=season,
         per_mode_detailed=per_mode,
@@ -95,11 +246,7 @@ def get_player_stats(
 
 
 @app.get("/team/{team_id}/splits")
-def get_team_splits(
-    team_id: int,
-    season: str = DEFAULT_SEASON,
-    season_type: str = "Regular Season",
-):
+def get_team_splits(team_id: int, season: str = DEFAULT_SEASON, season_type: str = "Regular Season"):
     splits = teamdashboardbygeneralsplits.TeamDashboardByGeneralSplits(
         team_id=team_id,
         season=season,
@@ -126,3 +273,120 @@ def player_by_name(name: str):
     if not results:
         raise HTTPException(status_code=404, detail=f"No players found for '{name}'")
     return {"best_match": results[0], "top_matches": results[:10]}
+
+
+# ----------------------------
+# NEW: Pro-style prop prediction endpoint
+# ----------------------------
+@app.post("/predict/prop")
+def predict_prop(payload: Dict[str, Any]):
+    """
+    payload example:
+    {
+      "player_id": 2544,
+      "season": "2025-26",
+      "stat": "PTS",
+      "line": 27.5,
+      "over_odds": -110,
+      "under_odds": -110
+    }
+    """
+    player_id = payload.get("player_id")
+    season = payload.get("season", DEFAULT_SEASON)
+    stat: str = payload.get("stat", "PTS")
+    line = payload.get("line")
+
+    over_odds = payload.get("over_odds")    # optional int
+    under_odds = payload.get("under_odds")  # optional int
+
+    if player_id is None:
+        raise HTTPException(status_code=400, detail="player_id is required")
+    if line is None:
+        raise HTTPException(status_code=400, detail="line is required")
+    if stat not in STAT_MAP:
+        raise HTTPException(status_code=400, detail=f"stat must be one of {list(STAT_MAP.keys())}")
+
+    df = gamelog_df(int(player_id), str(season))
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No game log data returned (player/season may be wrong)")
+
+    stat_col = STAT_MAP[stat]
+    n_games = int(len(df))
+
+    mins = estimate_minutes(df, last_n=10)
+    rate = estimate_rate_per_minute(df, stat_col=stat_col, last_n=15)
+    dist = combine_minutes_rate_to_stat_dist(mins, rate)
+
+    mean = dist["mean"]
+    sd = dist["sd"]
+
+    p_over_model = prob_over(float(line), mean, sd)
+    p_under_model = 1.0 - p_over_model
+
+    # Percentiles (normal approx)
+    p10 = float(norm.ppf(0.10, loc=mean, scale=sd))
+    p50 = float(mean)
+    p90 = float(norm.ppf(0.90, loc=mean, scale=sd))
+
+    confidence = confidence_label(mins["sd"], sd, n_games)
+
+    market = None
+    edge_pct = None
+    stake = {"recommendation": "NO_BET", "units": 0.0}
+
+    # If odds provided, compute no-vig and edge
+    if isinstance(over_odds, int) and isinstance(under_odds, int):
+        p_over_imp = american_to_implied_prob(over_odds)
+        p_under_imp = american_to_implied_prob(under_odds)
+        nv = no_vig_two_way(p_over_imp, p_under_imp)
+
+        edge_pct = (p_over_model - nv["p_over"]) * 100.0  # percentage points
+        market = {
+            "over_odds": over_odds,
+            "under_odds": under_odds,
+            "implied": {"p_over": p_over_imp, "p_under": p_under_imp},
+            "no_vig": nv,
+        }
+        stake = unit_sizing(edge_pct, confidence)
+
+    # Recommendation logic
+    pick = "NO_BET"
+    if edge_pct is not None:
+        if stake["recommendation"] == "PLAY":
+            pick = "OVER" if p_over_model >= 0.5 else "UNDER"
+    else:
+        # If no odds, provide a lean only if probability is meaningfully away from 50%
+        if confidence != "low" and abs(p_over_model - 0.5) >= 0.06:
+            pick = "OVER" if p_over_model > 0.5 else "UNDER"
+
+    return {
+        "input": {
+            "player_id": int(player_id),
+            "season": str(season),
+            "stat": stat,
+            "line": float(line),
+        },
+        "projection": {
+            "mean": round(mean, 2),
+            "sd": round(sd, 2),
+            "p10": round(p10, 2),
+            "p50": round(p50, 2),
+            "p90": round(p90, 2),
+        },
+        "probabilities": {
+            "p_over": round(p_over_model, 4),
+            "p_under": round(p_under_model, 4),
+        },
+        "confidence": confidence,
+        "market": market,  # None if no odds passed
+        "edge_pct_points": None if edge_pct is None else round(edge_pct, 2),
+        "stake": stake,
+        "recommendation": pick,
+        "notes": {
+            "n_games_used": n_games,
+            "minutes_mean": round(mins["mean"], 2),
+            "minutes_sd": round(mins["sd"], 2),
+            "rate_per_min_mean": round(rate["mean"], 4),
+            "rate_per_min_sd": round(rate["sd"], 4),
+        },
+    }
