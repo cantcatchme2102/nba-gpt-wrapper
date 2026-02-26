@@ -20,7 +20,7 @@ from nba_api.stats.endpoints import (
 
 DEFAULT_SEASON = os.getenv("DEFAULT_SEASON", "2025-26")
 
-app = FastAPI(title="NBA Stats Wrapper", version="1.2.2")
+app = FastAPI(title="NBA Stats Wrapper", version="1.2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,7 +55,7 @@ def normal_cdf(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 def normal_ppf(p: float) -> float:
-    # Acklam approximation
+    # Acklam approximation (good enough for p10/p90)
     if p <= 0.0:
         return -math.inf
     if p >= 1.0:
@@ -80,6 +80,7 @@ def normal_ppf(p: float) -> float:
         q = math.sqrt(-2 * math.log(p))
         return (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
                ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1)
+
     if p > phigh:
         q = math.sqrt(-2 * math.log(1 - p))
         return -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5]) / \
@@ -94,7 +95,7 @@ def normal_ppf_loc_scale(p: float, mean: float, sd: float) -> float:
     return mean + sd * normal_ppf(p)
 
 # ----------------------------
-# Helpers: odds / no-vig
+# Odds / no-vig helpers
 # ----------------------------
 def american_to_implied_prob(odds: int) -> float:
     if odds == 0:
@@ -110,7 +111,7 @@ def no_vig_two_way(p_over: float, p_under: float) -> Dict[str, float]:
     return {"p_over": p_over / s, "p_under": p_under / s, "vig": max(0.0, s - 1.0)}
 
 # ----------------------------
-# Helpers: nba_api -> DataFrame
+# nba_api -> DataFrame helper
 # ----------------------------
 def safe_float(x, default=0.0) -> float:
     try:
@@ -119,13 +120,16 @@ def safe_float(x, default=0.0) -> float:
         return float(default)
 
 def gamelog_df(player_id: int, season: str) -> pd.DataFrame:
+    """
+    Pull player logs and convert to a dataframe.
+    Any stats.nba.com block/timeout becomes a readable 502.
+    """
     try:
         gl = playergamelog.PlayerGameLog(
             player_id=player_id,
             season=season,
             timeout=60,
             headers=NBA_HEADERS,
-            raise_exception_on_error=True,
         )
         d = gl.get_dict()
         rs = d.get("resultSets", [])
@@ -139,16 +143,18 @@ def gamelog_df(player_id: int, season: str) -> pd.DataFrame:
         raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
 
 # ----------------------------
-# Pro baseline: Minutes × Rate
+# Pro baseline model: Minutes × Rate
 # ----------------------------
 STAT_MAP = {"PTS": "PTS", "REB": "REB", "AST": "AST", "FG3M": "FG3M"}
 
 def estimate_minutes(df: pd.DataFrame, last_n: int = 10) -> Dict[str, float]:
     if df.empty:
         return {"mean": 0.0, "sd": 8.0}
+
     mins = df["MIN"].tail(last_n).apply(safe_float).to_numpy()
     if len(mins) == 0:
         return {"mean": 0.0, "sd": 8.0}
+
     mean = float(np.mean(mins))
     sd = float(np.std(mins, ddof=1)) if len(mins) > 1 else 6.0
     sd = float(np.clip(sd, 3.0, 12.0))
@@ -157,12 +163,15 @@ def estimate_minutes(df: pd.DataFrame, last_n: int = 10) -> Dict[str, float]:
 def estimate_rate_per_minute(df: pd.DataFrame, stat_col: str, last_n: int = 15) -> Dict[str, float]:
     if df.empty:
         return {"mean": 0.0, "sd": 0.05}
+
     tail = df.tail(last_n).copy()
     tail["MIN_f"] = tail["MIN"].apply(safe_float)
     tail[stat_col] = tail[stat_col].apply(safe_float)
+
     tail = tail[tail["MIN_f"] > 0]
     if tail.empty:
         return {"mean": 0.0, "sd": 0.05}
+
     rates = (tail[stat_col] / tail["MIN_f"]).to_numpy()
     mean = float(np.mean(rates))
     sd = float(np.std(rates, ddof=1)) if len(rates) > 1 else max(0.03, 0.15 * mean)
@@ -170,8 +179,10 @@ def estimate_rate_per_minute(df: pd.DataFrame, stat_col: str, last_n: int = 15) 
     return {"mean": mean, "sd": sd}
 
 def combine_minutes_rate(mins: Dict[str, float], rate: Dict[str, float]) -> Dict[str, float]:
+    # X = M * R, approximate variance assuming independence
     m_mu, m_sd = mins["mean"], mins["sd"]
     r_mu, r_sd = rate["mean"], rate["sd"]
+
     mean = m_mu * r_mu
     var = (m_mu**2) * (r_sd**2) + (r_mu**2) * (m_sd**2) + (m_sd**2) * (r_sd**2)
     sd = math.sqrt(max(1e-9, var))
@@ -203,6 +214,7 @@ def confidence_label(minutes_sd: float, stat_sd: float, n_games: int) -> str:
     return "low"
 
 def unit_sizing(edge_pct: float, confidence: str) -> Dict[str, Any]:
+    # Conservative, pro-ish unit buckets
     if edge_pct < 2.0 or confidence == "low":
         return {"recommendation": "NO_BET", "units": 0.0}
     if edge_pct < 3.5:
@@ -212,7 +224,7 @@ def unit_sizing(edge_pct: float, confidence: str) -> Dict[str, Any]:
     return {"recommendation": "PLAY", "units": 1.5}
 
 # ----------------------------
-# Endpoints: data
+# Endpoints: health + lookup
 # ----------------------------
 @app.get("/health")
 def health():
@@ -247,6 +259,9 @@ def team_by_abbr(abbr: str):
             return t
     raise HTTPException(status_code=404, detail=f"Team not found for abbreviation '{abbr}'")
 
+# ----------------------------
+# Endpoints: NBA stats calls
+# ----------------------------
 @app.get("/scoreboard")
 def get_scoreboard(game_date: str):
     game_date = (game_date or "").strip()
@@ -257,7 +272,6 @@ def get_scoreboard(game_date: str):
             game_date=game_date,
             timeout=60,
             headers=NBA_HEADERS,
-            raise_exception_on_error=True,
         )
         return sb.get_dict()
     except Exception as e:
@@ -278,7 +292,6 @@ def get_team_gamelog(team_id: int, season: str = DEFAULT_SEASON, season_type: st
             season_type_all_star=season_type,
             timeout=60,
             headers=NBA_HEADERS,
-            raise_exception_on_error=True,
         )
         return tg.get_dict()
     except Exception as e:
@@ -294,7 +307,6 @@ def get_team_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", seas
             season_type_all_star=season_type,
             timeout=60,
             headers=NBA_HEADERS,
-            raise_exception_on_error=True,
         )
         return ts.get_dict()
     except Exception as e:
@@ -310,7 +322,6 @@ def get_player_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", se
             season_type_all_star=season_type,
             timeout=60,
             headers=NBA_HEADERS,
-            raise_exception_on_error=True,
         )
         return ps.get_dict()
     except Exception as e:
@@ -326,7 +337,6 @@ def get_team_splits(team_id: int, season: str = DEFAULT_SEASON, season_type: str
             season_type_all_star=season_type,
             timeout=60,
             headers=NBA_HEADERS,
-            raise_exception_on_error=True,
         )
         return splits.get_dict()
     except Exception as e:
@@ -338,6 +348,17 @@ def get_team_splits(team_id: int, season: str = DEFAULT_SEASON, season_type: str
 # ----------------------------
 @app.post("/predict/prop")
 def predict_prop(payload: Dict[str, Any]):
+    """
+    payload example:
+    {
+      "player_id": 2544,
+      "season": "2025-26",
+      "stat": "PTS",
+      "line": 27.5,
+      "over_odds": -110,
+      "under_odds": -110
+    }
+    """
     player_id = payload.get("player_id")
     season = payload.get("season", DEFAULT_SEASON)
     stat: str = payload.get("stat", "PTS")
@@ -399,6 +420,7 @@ def predict_prop(payload: Dict[str, Any]):
         if stake["recommendation"] == "PLAY":
             pick = "OVER" if p_over_model >= 0.5 else "UNDER"
     else:
+        # no odds -> only lean if clearly away from 50%
         if confidence != "low" and abs(p_over_model - 0.5) >= 0.06:
             pick = "OVER" if p_over_model > 0.5 else "UNDER"
 
