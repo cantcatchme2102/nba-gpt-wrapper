@@ -1,24 +1,18 @@
 import os
 import math
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Tuple, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from nba_api.stats.static import players, teams
-from nba_api.stats.endpoints import (
-    scoreboardv2,
-    playergamelog,
-    leaguedashteamstats,
-    leaguedashplayerstats,
-    teamgamelog,
-    teamdashboardbygeneralsplits,
-)
+from nba_api.stats.static import players
+from nba_api.stats.endpoints import playergamelog
+
 
 DEFAULT_SEASON = os.getenv("DEFAULT_SEASON", "2025-26")
 
-app = FastAPI(title="NBA Stats Wrapper", version="1.3.0")
+app = FastAPI(title="Local NBA API (Tunnel)", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,6 +21,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ----------------------------
+# NBA headers (cloud-friendly)
+# ----------------------------
 NBA_HEADERS = {
     "Host": "stats.nba.com",
     "User-Agent": (
@@ -45,9 +42,15 @@ NBA_HEADERS = {
 
 STAT_MAP = {"PTS": "PTS", "REB": "REB", "AST": "AST", "FG3M": "FG3M"}  # 3PM = FG3M
 
+# ----------------------------
+# Simple in-memory cache
+# ----------------------------
+CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+CACHE_TTL_SECONDS = 60 * 30  # 30 minutes
+
 
 # ----------------------------
-# Basic stats helpers (pure python)
+# Basic math helpers (pure python)
 # ----------------------------
 def safe_float(x, default=0.0) -> float:
     try:
@@ -59,7 +62,6 @@ def mean(xs: List[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 def stdev(xs: List[float]) -> float:
-    # sample standard deviation
     n = len(xs)
     if n <= 1:
         return 0.0
@@ -132,38 +134,64 @@ def no_vig_two_way(p_over: float, p_under: float) -> Dict[str, float]:
 
 
 # ----------------------------
-# NBA fetch helpers (no pandas)
+# NBA fetch (with caching + tuned retries)
 # ----------------------------
+def cache_get(key: str) -> Optional[List[Dict[str, Any]]]:
+    item = CACHE.get(key)
+    if not item:
+        return None
+    ts, data = item
+    if time.time() - ts > CACHE_TTL_SECONDS:
+        return None
+    return data
+
+def cache_set(key: str, data: List[Dict[str, Any]]) -> None:
+    CACHE[key] = (time.time(), data)
+
 def fetch_player_gamelog_rows(player_id: int, season: str) -> List[Dict[str, Any]]:
-    # retries handle slow NBA responses
+    cache_key = f"gamelog:{player_id}:{season}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     last_err = None
-    for attempt in range(1, 4):
+
+    # FIX: 2 tries x 30s is better for GPT calls than 3 x 20s (less total + higher success)
+    for attempt in range(1, 3):
         try:
             gl = playergamelog.PlayerGameLog(
                 player_id=player_id,
                 season=season,
-                timeout=20,
+                timeout=30,
                 headers=NBA_HEADERS,
             )
             d = gl.get_dict()
             rs = d.get("resultSets", [])
             if not rs:
+                cache_set(cache_key, [])
                 return []
+
             headers = rs[0]["headers"]
             rows = rs[0]["rowSet"]
-            # convert to list[dict]
-            out = []
+
+            out: List[Dict[str, Any]] = []
             for r in rows:
                 out.append({headers[i]: r[i] for i in range(len(headers))})
+
+            cache_set(cache_key, out)
             return out
+
         except Exception as e:
             last_err = e
-            time.sleep(1.5 * attempt)
+            time.sleep(2.0 * attempt)  # 2s then 4s
 
     msg = f"{type(last_err).__name__}: {str(last_err)}"
     raise HTTPException(status_code=502, detail=f"NBA stats fetch failed after retries: {msg[:300]}")
 
 
+# ----------------------------
+# Model: Minutes x Rate -> Normal approx
+# ----------------------------
 def estimate_minutes(rows: List[Dict[str, Any]], last_n: int = 10) -> Dict[str, float]:
     mins = [safe_float(r.get("MIN", 0)) for r in rows[:last_n]]
     mins = [m for m in mins if m > 0]
@@ -175,7 +203,7 @@ def estimate_minutes(rows: List[Dict[str, Any]], last_n: int = 10) -> Dict[str, 
 
 def estimate_rate_per_minute(rows: List[Dict[str, Any]], stat_col: str, last_n: int = 15) -> Dict[str, float]:
     tail = rows[:last_n]
-    rates = []
+    rates: List[float] = []
     for r in tail:
         m = safe_float(r.get("MIN", 0))
         s = safe_float(r.get(stat_col, 0))
@@ -252,30 +280,16 @@ def player_by_name(name: str):
         raise HTTPException(status_code=404, detail=f"No players found for '{name}'")
     return {"best_match": res[0], "top_matches": res[:10]}
 
-@app.get("/teams")
-def list_teams():
-    return {"results": teams.get_teams()}
-
-@app.get("/scoreboard")
-def get_scoreboard(game_date: str):
-    game_date = (game_date or "").strip()
-    if len(game_date) != 10:
-        raise HTTPException(status_code=400, detail="game_date must be YYYY-MM-DD")
-    try:
-        sb = scoreboardv2.ScoreboardV2(
-            game_date=game_date,
-            timeout=20,
-            headers=NBA_HEADERS,
-        )
-        return sb.get_dict()
-    except Exception as e:
-        msg = f"{type(e).__name__}: {str(e)}"
-        raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
-
 @app.get("/player/{player_id}/gamelog")
 def get_player_gamelog(player_id: int, season: str = DEFAULT_SEASON):
     rows = fetch_player_gamelog_rows(int(player_id), str(season))
     return {"player_id": int(player_id), "season": str(season), "rows": rows}
+
+# NEW: Warmup endpoint (prime the cache)
+@app.get("/warmup/player/{player_id}")
+def warmup_player(player_id: int, season: str = DEFAULT_SEASON):
+    rows = fetch_player_gamelog_rows(int(player_id), str(season))
+    return {"ok": True, "player_id": int(player_id), "season": str(season), "rows_cached": len(rows)}
 
 @app.post("/predict/prop")
 def predict_prop(payload: Dict[str, Any]):
@@ -298,7 +312,6 @@ def predict_prop(payload: Dict[str, Any]):
     if not rows:
         raise HTTPException(status_code=404, detail="No game log rows returned")
 
-    # nba_api returns newest first; that’s fine for “last N”
     n_games = len(rows)
     stat_col = STAT_MAP[stat]
 
@@ -337,16 +350,21 @@ def predict_prop(payload: Dict[str, Any]):
         stake = unit_sizing(edge_pct, conf)
 
     pick = "NO_BET"
-    if edge_pct is not None:
-        if stake["recommendation"] == "PLAY":
-            pick = "OVER" if p_over >= 0.5 else "UNDER"
-    else:
+    if edge_pct is not None and stake["recommendation"] == "PLAY":
+        pick = "OVER" if p_over >= 0.5 else "UNDER"
+    elif edge_pct is None:
         if conf != "low" and abs(p_over - 0.5) >= 0.06:
             pick = "OVER" if p_over > 0.5 else "UNDER"
 
     return {
         "input": {"player_id": int(player_id), "season": str(season), "stat": stat, "line": float(line)},
-        "projection": {"mean": round(mu, 2), "sd": round(sd, 2), "p10": round(p10, 2), "p50": round(p50, 2), "p90": round(p90, 2)},
+        "projection": {
+            "mean": round(mu, 2),
+            "sd": round(sd, 2),
+            "p10": round(p10, 2),
+            "p50": round(p50, 2),
+            "p90": round(p90, 2),
+        },
         "probabilities": {"p_over": round(p_over, 4), "p_under": round(p_under, 4)},
         "confidence": conf,
         "market": market,
@@ -359,5 +377,6 @@ def predict_prop(payload: Dict[str, Any]):
             "minutes_sd": round(mins["sd"], 2),
             "rate_per_min_mean": round(rate["mean"], 4),
             "rate_per_min_sd": round(rate["sd"], 4),
+            "cache_ttl_minutes": int(CACHE_TTL_SECONDS / 60),
         },
     }
