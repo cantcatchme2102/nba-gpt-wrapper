@@ -9,6 +9,8 @@ from scipy.stats import norm
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+# nba_api
+from nba_api import debug
 from nba_api.stats.static import players, teams
 from nba_api.stats.endpoints import (
     scoreboardv2,
@@ -19,7 +21,28 @@ from nba_api.stats.endpoints import (
     teamdashboardbygeneralsplits,
 )
 
-app = FastAPI(title="NBA Stats Wrapper", version="1.1.0")
+# ----------------------------
+# NBA headers (important on cloud hosting)
+# ----------------------------
+debug.STATS_HEADERS = {
+    "Host": "stats.nba.com",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://stats.nba.com/",
+    "Origin": "https://stats.nba.com",
+    "Connection": "keep-alive",
+    "x-nba-stats-origin": "stats",
+    "x-nba-stats-token": "true",
+}
+
+DEFAULT_SEASON = os.getenv("DEFAULT_SEASON", "2025-26")
+
+app = FastAPI(title="NBA Stats Wrapper", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,8 +50,6 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
-
-DEFAULT_SEASON = os.getenv("DEFAULT_SEASON", "2025-26")
 
 # ----------------------------
 # Helpers: odds / no-vig
@@ -48,20 +69,6 @@ def no_vig_two_way(p_over: float, p_under: float) -> Dict[str, float]:
     return {"p_over": p_over / s, "p_under": p_under / s, "vig": max(0.0, s - 1.0)}
 
 
-def odds_to_decimal(odds: int) -> float:
-    if odds < 0:
-        return 1.0 + (100.0 / (-odds))
-    return 1.0 + (odds / 100.0)
-
-
-def kelly_fraction(p: float, b: float) -> float:
-    # b = decimal_odds - 1
-    if b <= 0:
-        return 0.0
-    f = (b * p - (1.0 - p)) / b
-    return max(0.0, f)
-
-
 # ----------------------------
 # Helpers: nba_api -> DataFrame
 # ----------------------------
@@ -73,19 +80,31 @@ def safe_float(x, default=0.0) -> float:
 
 
 def gamelog_df(player_id: int, season: str) -> pd.DataFrame:
-    gl = playergamelog.PlayerGameLog(player_id=player_id, season=season)
-    d = gl.get_dict()
-    rs = d.get("resultSets", [])
-    if not rs:
-        return pd.DataFrame()
-    headers = rs[0]["headers"]
-    rows = rs[0]["rowSet"]
-    return pd.DataFrame(rows, columns=headers)
-
+    """
+    Pulls player game log via nba_api.
+    If stats.nba.com blocks/timeouts, we convert it to a readable 502 error.
+    """
+    try:
+        gl = playergamelog.PlayerGameLog(
+            player_id=player_id,
+            season=season,
+            timeout=60,                    # increase timeout for Render
+            raise_exception_on_error=True, # bubble up HTTP problems
+        )
+        d = gl.get_dict()
+        rs = d.get("resultSets", [])
+        if not rs:
+            return pd.DataFrame()
+        headers = rs[0]["headers"]
+        rows = rs[0]["rowSet"]
+        return pd.DataFrame(rows, columns=headers)
+    except Exception as e:
+        # IMPORTANT: this makes your errors readable (instead of Render "500")
+        msg = f"{type(e).__name__}: {str(e)}"
+        raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
 
 # ----------------------------
-# Pro-style baseline model
-# (Minutes × Rate with uncertainty)
+# Pro-style baseline model (Minutes × Rate)
 # ----------------------------
 STAT_MAP = {
     "PTS": "PTS",
@@ -130,7 +149,7 @@ def estimate_rate_per_minute(df: pd.DataFrame, stat_col: str, last_n: int = 15) 
 
 
 def combine_minutes_rate_to_stat_dist(mins: Dict[str, float], rate: Dict[str, float]) -> Dict[str, float]:
-    # X = M * R, approx variance assuming independence
+    # X = M * R, approximate variance assuming independence
     m_mu, m_sd = mins["mean"], mins["sd"]
     r_mu, r_sd = rate["mean"], rate["sd"]
 
@@ -169,7 +188,6 @@ def confidence_label(minutes_sd: float, stat_sd: float, n_games: int) -> str:
 
 
 def unit_sizing(edge_pct: float, confidence: str) -> Dict[str, Any]:
-    # Conservative “pro-ish” unit buckets
     if edge_pct < 2.0 or confidence == "low":
         return {"recommendation": "NO_BET", "units": 0.0}
     if edge_pct < 3.5:
@@ -177,7 +195,6 @@ def unit_sizing(edge_pct: float, confidence: str) -> Dict[str, Any]:
     if edge_pct < 6.0:
         return {"recommendation": "PLAY", "units": 1.0}
     return {"recommendation": "PLAY", "units": 1.5}
-
 
 # ----------------------------
 # Read data endpoints
@@ -196,74 +213,6 @@ def search_players(q: str):
     return {"query": q, "results": results[:10]}
 
 
-@app.get("/teams")
-def list_teams():
-    return {"results": teams.get_teams()}
-
-
-@app.get("/scoreboard")
-def get_scoreboard(game_date: str):
-    """
-    game_date: YYYY-MM-DD (example: 2026-02-25)
-    """
-    game_date = (game_date or "").strip()
-    if len(game_date) != 10:
-        raise HTTPException(status_code=400, detail="game_date must be YYYY-MM-DD")
-    sb = scoreboardv2.ScoreboardV2(game_date=game_date)
-    return sb.get_dict()
-
-
-@app.get("/player/{player_id}/gamelog")
-def get_player_gamelog(player_id: int, season: str = DEFAULT_SEASON):
-    gl = playergamelog.PlayerGameLog(player_id=player_id, season=season)
-    return gl.get_dict()
-
-
-@app.get("/team/{team_id}/gamelog")
-def get_team_gamelog(team_id: int, season: str = DEFAULT_SEASON, season_type: str = "Regular Season"):
-    tg = teamgamelog.TeamGameLog(team_id=team_id, season=season, season_type_all_star=season_type)
-    return tg.get_dict()
-
-
-@app.get("/teamstats")
-def get_team_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", season_type: str = "Regular Season"):
-    ts = leaguedashteamstats.LeagueDashTeamStats(
-        season=season,
-        per_mode_detailed=per_mode,
-        season_type_all_star=season_type,
-    )
-    return ts.get_dict()
-
-
-@app.get("/playerstats")
-def get_player_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", season_type: str = "Regular Season"):
-    ps = leaguedashplayerstats.LeagueDashPlayerStats(
-        season=season,
-        per_mode_detailed=per_mode,
-        season_type_all_star=season_type,
-    )
-    return ps.get_dict()
-
-
-@app.get("/team/{team_id}/splits")
-def get_team_splits(team_id: int, season: str = DEFAULT_SEASON, season_type: str = "Regular Season"):
-    splits = teamdashboardbygeneralsplits.TeamDashboardByGeneralSplits(
-        team_id=team_id,
-        season=season,
-        season_type_all_star=season_type,
-    )
-    return splits.get_dict()
-
-
-@app.get("/meta/team/by_abbr")
-def team_by_abbr(abbr: str):
-    abbr = (abbr or "").strip().upper()
-    for t in teams.get_teams():
-        if t.get("abbreviation") == abbr:
-            return t
-    raise HTTPException(status_code=404, detail=f"Team not found for abbreviation '{abbr}'")
-
-
 @app.get("/meta/player/by_name")
 def player_by_name(name: str):
     name = (name or "").strip()
@@ -275,8 +224,112 @@ def player_by_name(name: str):
     return {"best_match": results[0], "top_matches": results[:10]}
 
 
+@app.get("/teams")
+def list_teams():
+    return {"results": teams.get_teams()}
+
+
+@app.get("/meta/team/by_abbr")
+def team_by_abbr(abbr: str):
+    abbr = (abbr or "").strip().upper()
+    for t in teams.get_teams():
+        if t.get("abbreviation") == abbr:
+            return t
+    raise HTTPException(status_code=404, detail=f"Team not found for abbreviation '{abbr}'")
+
+
+@app.get("/scoreboard")
+def get_scoreboard(game_date: str):
+    game_date = (game_date or "").strip()
+    if len(game_date) != 10:
+        raise HTTPException(status_code=400, detail="game_date must be YYYY-MM-DD")
+    try:
+        sb = scoreboardv2.ScoreboardV2(
+            game_date=game_date,
+            timeout=60,
+            raise_exception_on_error=True,
+        )
+        return sb.get_dict()
+    except Exception as e:
+        msg = f"{type(e).__name__}: {str(e)}"
+        raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
+
+
+@app.get("/player/{player_id}/gamelog")
+def get_player_gamelog(player_id: int, season: str = DEFAULT_SEASON):
+    # uses the same hardened fetch
+    df = gamelog_df(int(player_id), str(season))
+    # Return in the same “nba_api style” dict shape? Here we return dataframe records
+    # so GPT can read it easily. If you prefer nba_api raw dict, tell me.
+    return {"player_id": int(player_id), "season": str(season), "rows": df.to_dict(orient="records")}
+
+
+@app.get("/team/{team_id}/gamelog")
+def get_team_gamelog(team_id: int, season: str = DEFAULT_SEASON, season_type: str = "Regular Season"):
+    try:
+        tg = teamgamelog.TeamGameLog(
+            team_id=team_id,
+            season=season,
+            season_type_all_star=season_type,
+            timeout=60,
+            raise_exception_on_error=True,
+        )
+        return tg.get_dict()
+    except Exception as e:
+        msg = f"{type(e).__name__}: {str(e)}"
+        raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
+
+
+@app.get("/teamstats")
+def get_team_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", season_type: str = "Regular Season"):
+    try:
+        ts = leaguedashteamstats.LeagueDashTeamStats(
+            season=season,
+            per_mode_detailed=per_mode,
+            season_type_all_star=season_type,
+            timeout=60,
+            raise_exception_on_error=True,
+        )
+        return ts.get_dict()
+    except Exception as e:
+        msg = f"{type(e).__name__}: {str(e)}"
+        raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
+
+
+@app.get("/playerstats")
+def get_player_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", season_type: str = "Regular Season"):
+    try:
+        ps = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=season,
+            per_mode_detailed=per_mode,
+            season_type_all_star=season_type,
+            timeout=60,
+            raise_exception_on_error=True,
+        )
+        return ps.get_dict()
+    except Exception as e:
+        msg = f"{type(e).__name__}: {str(e)}"
+        raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
+
+
+@app.get("/team/{team_id}/splits")
+def get_team_splits(team_id: int, season: str = DEFAULT_SEASON, season_type: str = "Regular Season"):
+    try:
+        splits = teamdashboardbygeneralsplits.TeamDashboardByGeneralSplits(
+            team_id=team_id,
+            season=season,
+            season_type_all_star=season_type,
+            timeout=60,
+            raise_exception_on_error=True,
+        )
+        return splits.get_dict()
+    except Exception as e:
+        msg = f"{type(e).__name__}: {str(e)}"
+        raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
+
+
 # ----------------------------
-# NEW: Pro-style prop prediction endpoint
+# Pro-style prop prediction endpoint
 # ----------------------------
 @app.post("/predict/prop")
 def predict_prop(payload: Dict[str, Any]):
@@ -334,7 +387,6 @@ def predict_prop(payload: Dict[str, Any]):
     edge_pct = None
     stake = {"recommendation": "NO_BET", "units": 0.0}
 
-    # If odds provided, compute no-vig and edge
     if isinstance(over_odds, int) and isinstance(under_odds, int):
         p_over_imp = american_to_implied_prob(over_odds)
         p_under_imp = american_to_implied_prob(under_odds)
@@ -355,7 +407,7 @@ def predict_prop(payload: Dict[str, Any]):
         if stake["recommendation"] == "PLAY":
             pick = "OVER" if p_over_model >= 0.5 else "UNDER"
     else:
-        # If no odds, provide a lean only if probability is meaningfully away from 50%
+        # if no odds, only lean when clearly away from 50% and not low confidence
         if confidence != "low" and abs(p_over_model - 0.5) >= 0.06:
             pick = "OVER" if p_over_model > 0.5 else "UNDER"
 
@@ -378,7 +430,7 @@ def predict_prop(payload: Dict[str, Any]):
             "p_under": round(p_under_model, 4),
         },
         "confidence": confidence,
-        "market": market,  # None if no odds passed
+        "market": market,
         "edge_pct_points": None if edge_pct is None else round(edge_pct, 2),
         "stake": stake,
         "recommendation": pick,
