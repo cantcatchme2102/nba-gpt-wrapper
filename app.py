@@ -8,8 +8,6 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# nba_api
-from nba_api import debug
 from nba_api.stats.static import players, teams
 from nba_api.stats.endpoints import (
     scoreboardv2,
@@ -20,10 +18,21 @@ from nba_api.stats.endpoints import (
     teamdashboardbygeneralsplits,
 )
 
+DEFAULT_SEASON = os.getenv("DEFAULT_SEASON", "2025-26")
+
+app = FastAPI(title="NBA Stats Wrapper", version="1.2.2")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
 # ----------------------------
-# NBA headers (important on cloud hosting)
+# NBA headers (cloud-friendly)
 # ----------------------------
-debug.STATS_HEADERS = {
+NBA_HEADERS = {
     "Host": "stats.nba.com",
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -39,35 +48,19 @@ debug.STATS_HEADERS = {
     "x-nba-stats-token": "true",
 }
 
-DEFAULT_SEASON = os.getenv("DEFAULT_SEASON", "2025-26")
-
-app = FastAPI(title="NBA Stats Wrapper", version="1.2.1")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
-
 # ----------------------------
 # Normal CDF + PPF (NO SCIPY)
 # ----------------------------
 def normal_cdf(z: float) -> float:
-    # Standard normal CDF using erf
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 def normal_ppf(p: float) -> float:
-    """
-    Approx inverse CDF for standard normal (Acklam approximation).
-    Good enough for p10/p90 reporting.
-    """
+    # Acklam approximation
     if p <= 0.0:
         return -math.inf
     if p >= 1.0:
         return math.inf
 
-    # Coefficients in rational approximations
     a = [-3.969683028665376e+01,  2.209460984245205e+02,
          -2.759285104469687e+02,  1.383577518672690e+02,
          -3.066479806614716e+01,  2.506628277459239e+00]
@@ -126,14 +119,12 @@ def safe_float(x, default=0.0) -> float:
         return float(default)
 
 def gamelog_df(player_id: int, season: str) -> pd.DataFrame:
-    """
-    Hardened nba_api call: longer timeout + readable errors.
-    """
     try:
         gl = playergamelog.PlayerGameLog(
             player_id=player_id,
             season=season,
             timeout=60,
+            headers=NBA_HEADERS,
             raise_exception_on_error=True,
         )
         d = gl.get_dict()
@@ -148,7 +139,7 @@ def gamelog_df(player_id: int, season: str) -> pd.DataFrame:
         raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
 
 # ----------------------------
-# Pro-style baseline model (Minutes × Rate)
+# Pro baseline: Minutes × Rate
 # ----------------------------
 STAT_MAP = {"PTS": "PTS", "REB": "REB", "AST": "AST", "FG3M": "FG3M"}
 
@@ -178,10 +169,9 @@ def estimate_rate_per_minute(df: pd.DataFrame, stat_col: str, last_n: int = 15) 
     sd = float(np.clip(sd, 0.02, 0.25))
     return {"mean": mean, "sd": sd}
 
-def combine_minutes_rate_to_stat_dist(mins: Dict[str, float], rate: Dict[str, float]) -> Dict[str, float]:
+def combine_minutes_rate(mins: Dict[str, float], rate: Dict[str, float]) -> Dict[str, float]:
     m_mu, m_sd = mins["mean"], mins["sd"]
     r_mu, r_sd = rate["mean"], rate["sd"]
-
     mean = m_mu * r_mu
     var = (m_mu**2) * (r_sd**2) + (r_mu**2) * (m_sd**2) + (m_sd**2) * (r_sd**2)
     sd = math.sqrt(max(1e-9, var))
@@ -222,7 +212,7 @@ def unit_sizing(edge_pct: float, confidence: str) -> Dict[str, Any]:
     return {"recommendation": "PLAY", "units": 1.5}
 
 # ----------------------------
-# Read data endpoints
+# Endpoints: data
 # ----------------------------
 @app.get("/health")
 def health():
@@ -233,8 +223,7 @@ def search_players(q: str):
     q = (q or "").strip()
     if len(q) < 2:
         raise HTTPException(status_code=400, detail="q must be at least 2 characters")
-    results = players.find_players_by_full_name(q)
-    return {"query": q, "results": results[:10]}
+    return {"query": q, "results": players.find_players_by_full_name(q)[:10]}
 
 @app.get("/meta/player/by_name")
 def player_by_name(name: str):
@@ -267,6 +256,7 @@ def get_scoreboard(game_date: str):
         sb = scoreboardv2.ScoreboardV2(
             game_date=game_date,
             timeout=60,
+            headers=NBA_HEADERS,
             raise_exception_on_error=True,
         )
         return sb.get_dict()
@@ -287,6 +277,7 @@ def get_team_gamelog(team_id: int, season: str = DEFAULT_SEASON, season_type: st
             season=season,
             season_type_all_star=season_type,
             timeout=60,
+            headers=NBA_HEADERS,
             raise_exception_on_error=True,
         )
         return tg.get_dict()
@@ -302,6 +293,7 @@ def get_team_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", seas
             per_mode_detailed=per_mode,
             season_type_all_star=season_type,
             timeout=60,
+            headers=NBA_HEADERS,
             raise_exception_on_error=True,
         )
         return ts.get_dict()
@@ -317,6 +309,7 @@ def get_player_stats(season: str = DEFAULT_SEASON, per_mode: str = "PerGame", se
             per_mode_detailed=per_mode,
             season_type_all_star=season_type,
             timeout=60,
+            headers=NBA_HEADERS,
             raise_exception_on_error=True,
         )
         return ps.get_dict()
@@ -332,6 +325,7 @@ def get_team_splits(team_id: int, season: str = DEFAULT_SEASON, season_type: str
             season=season,
             season_type_all_star=season_type,
             timeout=60,
+            headers=NBA_HEADERS,
             raise_exception_on_error=True,
         )
         return splits.get_dict()
@@ -340,7 +334,7 @@ def get_team_splits(team_id: int, season: str = DEFAULT_SEASON, season_type: str
         raise HTTPException(status_code=502, detail=f"NBA stats fetch failed: {msg[:300]}")
 
 # ----------------------------
-# Pro-style prop prediction endpoint
+# Endpoint: prop prediction
 # ----------------------------
 @app.post("/predict/prop")
 def predict_prop(payload: Dict[str, Any]):
@@ -368,7 +362,7 @@ def predict_prop(payload: Dict[str, Any]):
 
     mins = estimate_minutes(df, last_n=10)
     rate = estimate_rate_per_minute(df, stat_col=stat_col, last_n=15)
-    dist = combine_minutes_rate_to_stat_dist(mins, rate)
+    dist = combine_minutes_rate(mins, rate)
 
     mean = dist["mean"]
     sd = dist["sd"]
@@ -376,7 +370,6 @@ def predict_prop(payload: Dict[str, Any]):
     p_over_model = prob_over(float(line), mean, sd)
     p_under_model = 1.0 - p_over_model
 
-    # Percentiles (normal approx)
     p10 = normal_ppf_loc_scale(0.10, mean, sd)
     p50 = mean
     p90 = normal_ppf_loc_scale(0.90, mean, sd)
@@ -392,7 +385,7 @@ def predict_prop(payload: Dict[str, Any]):
         p_under_imp = american_to_implied_prob(under_odds)
         nv = no_vig_two_way(p_over_imp, p_under_imp)
 
-        edge_pct = (p_over_model - nv["p_over"]) * 100.0  # percentage points
+        edge_pct = (p_over_model - nv["p_over"]) * 100.0
         market = {
             "over_odds": over_odds,
             "under_odds": under_odds,
@@ -437,6 +430,6 @@ def predict_prop(payload: Dict[str, Any]):
             "minutes_mean": round(mins["mean"], 2),
             "minutes_sd": round(mins["sd"], 2),
             "rate_per_min_mean": round(rate["mean"], 4),
-            "rate_per_min_sd": round(rate["mean"], 4),
+            "rate_per_min_sd": round(rate["sd"], 4),
         },
     }
